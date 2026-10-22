@@ -1529,7 +1529,7 @@
   const DEFAULT_SUPABASE_URL = '';   // 例如: 'https://xxxx.supabase.co'
   const DEFAULT_SUPABASE_KEY = '';   // 例如: 'eyJhbGciOi...'
 
-  let supabase = null;
+  let supabaseClient = null;
   let currentUser = null;
   let syncEnabled = false;
   let syncTimer = null;
@@ -1561,7 +1561,7 @@
       return false;
     }
     try {
-      supabase = window.supabase.createClient(config.url, config.key);
+      supabaseClient = window.supabase.createClient(config.url, config.key);
       return true;
     } catch (e) {
       console.error('Supabase 初始化失败:', e);
@@ -1580,11 +1580,11 @@
 
   // 从云端拉取数据
   async function syncFromCloud() {
-    if (!supabase || !currentUser) return;
+    if (!supabaseClient || !currentUser) return;
     isSyncing = true;
     updateSyncStatus('syncing', '同步中...');
     try {
-      const { data, error } = await supabase
+      const { data, error } = await supabaseClient
         .from('tasks')
         .select('*')
         .order('created_at', { ascending: false });
@@ -1633,7 +1633,7 @@
 
   // 将本地数据推送到云端
   async function syncToCloud() {
-    if (!supabase || !currentUser || isSyncing) {
+    if (!supabaseClient || !currentUser || isSyncing) {
       pendingSync = true;
       return;
     }
@@ -1645,7 +1645,7 @@
       const allTasks = [...tasks.pending, ...tasks.archived];
 
       // 获取云端现有任务ID
-      const { data: cloudTasks, error: fetchError } = await supabase
+      const { data: cloudTasks, error: fetchError } = await supabaseClient
         .from('tasks')
         .select('id');
       if (fetchError) throw fetchError;
@@ -1670,14 +1670,14 @@
 
         if (cloudIds.has(task.id)) {
           // 更新
-          const { error } = await supabase
+          const { error } = await supabaseClient
             .from('tasks')
             .update(payload)
             .eq('id', task.id);
           if (error) console.error('更新任务失败:', error);
         } else {
           // 新增
-          const { error } = await supabase
+          const { error } = await supabaseClient
             .from('tasks')
             .insert(payload);
           if (error) console.error('插入任务失败:', error);
@@ -1687,7 +1687,7 @@
       // 删除云端有但本地没有的任务
       for (const cid of cloudIds) {
         if (!localIds.has(cid)) {
-          const { error } = await supabase
+          const { error } = await supabaseClient
             .from('tasks')
             .delete()
             .eq('id', cid);
@@ -1727,7 +1727,7 @@
     if (!initSupabase()) {
       throw new Error('请先配置 Supabase URL 和 Key');
     }
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    const { data, error } = await supabaseClient.auth.signInWithPassword({ email, password });
     if (error) throw error;
     currentUser = data.user;
     syncEnabled = true;
@@ -1741,7 +1741,7 @@
     if (!initSupabase()) {
       throw new Error('请先配置 Supabase URL 和 Key');
     }
-    const { data, error } = await supabase.auth.signUp({ email, password });
+    const { data, error } = await supabaseClient.auth.signUp({ email, password });
     if (error) throw error;
     // 如果是自动登录（未开启邮箱验证），直接同步
     if (data.user && data.session) {
@@ -1756,8 +1756,8 @@
 
   // 退出登录
   async function signOut() {
-    if (supabase) {
-      await supabase.auth.signOut();
+    if (supabaseClient) {
+      await supabaseClient.auth.signOut();
     }
     currentUser = null;
     syncEnabled = false;
@@ -1769,7 +1769,7 @@
   async function checkAuth() {
     if (!initSupabase()) return;
     try {
-      const { data: { session } } = await supabase.auth.getSession();
+      const { data: { session } } = await supabaseClient.auth.getSession();
       if (session?.user) {
         currentUser = session.user;
         syncEnabled = true;
@@ -1777,7 +1777,7 @@
         await syncFromCloud();
 
         // 监听认证状态变化
-        supabase.auth.onAuthStateChange((event, session) => {
+        supabaseClient.auth.onAuthStateChange((event, session) => {
           if (event === 'SIGNED_OUT') {
             currentUser = null;
             syncEnabled = false;
