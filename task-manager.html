@@ -1578,7 +1578,7 @@
     txt.textContent = text;
   }
 
-  // 从云端拉取数据
+  // 从云端拉取并合并数据（智能合并，不会丢失数据）
   async function syncFromCloud() {
     if (!supabaseClient || !currentUser) return;
     isSyncing = true;
@@ -1591,20 +1591,24 @@
 
       if (error) throw error;
 
-      // 将云端数据转换为本地格式
+      // 将云端数据转换为本地格式（同时保留两套字段名，兼容本地渲染）
       const cloudTasks = { pending: [], archived: [] };
+      const cloudMap = new Map(); // id -> task
       for (const t of data || []) {
         const task = {
           id: t.id,
           title: t.title,
           description: t.description || '',
+          desc: t.description || '', // 兼容本地字段
           priority: t.priority || 'medium',
           tags: t.tags || [],
+          tag: (t.tags && t.tags[0]) || '', // 兼容本地字段
           subtasks: t.subtasks || [],
           createdAt: t.created_at,
           completedAt: t.completed_at,
           updatedAt: t.updated_at
         };
+        cloudMap.set(t.id, task);
         if (t.status === 'completed') {
           cloudTasks.archived.push(task);
         } else {
@@ -1612,10 +1616,87 @@
         }
       }
 
-      // 简单合并策略：取更新时间较新的
-      // 这里直接用云端覆盖本地（因为用户主动同步）
-      tasks = cloudTasks;
-      saveData();
+      // 本地数据汇总
+      const localAll = [...tasks.pending, ...tasks.archived];
+      const cloudAll = [...cloudTasks.pending, ...cloudTasks.archived];
+
+      // 情况1：云端为空，本地有数据 → 把本地数据上传到云端
+      if (cloudAll.length === 0 && localAll.length > 0) {
+        console.log('云端为空，上传本地数据');
+        await syncToCloud();
+        lastSyncAt = new Date();
+        updateSyncStatus('online', '已同步');
+        return;
+      }
+
+      // 情况2：本地为空，云端有数据 → 直接用云端数据
+      if (localAll.length === 0 && cloudAll.length > 0) {
+        console.log('本地为空，加载云端数据');
+        tasks = cloudTasks;
+        saveDataLocal();
+        render();
+        lastSyncAt = new Date();
+        updateSyncStatus('online', '已同步');
+        return;
+      }
+
+      // 情况3：两边都有数据 → 智能合并（按ID，取更新时间较新的）
+      console.log('两边都有数据，智能合并');
+      const mergedPending = [];
+      const mergedArchived = [];
+      const allIds = new Set([...localAll.map(t => t.id), ...cloudAll.map(t => t.id)]);
+
+      for (const id of allIds) {
+        const localTask = localAll.find(t => t.id === id);
+        const cloudTask = cloudAll.find(t => t.id === id);
+
+        let winner;
+        if (localTask && cloudTask) {
+          // 两边都有，取更新时间较新的
+          const localTime = new Date(localTask.updatedAt || localTask.createdAt).getTime();
+          const cloudTime = new Date(cloudTask.updatedAt || cloudTask.createdAt).getTime();
+          winner = cloudTime >= localTime ? cloudTask : localTask;
+        } else {
+          // 只有一边有，直接用
+          winner = localTask || cloudTask;
+        }
+
+        // 判断是待完成还是已归档
+        const isCompleted = tasks.archived.some(t => t.id === id) || 
+                           cloudTasks.archived.some(t => t.id === id);
+        // 如果两边状态不一致，取更新时间较新的那个的状态
+        if (localTask && cloudTask) {
+          const localTime = new Date(localTask.updatedAt || localTask.createdAt).getTime();
+          const cloudTime = new Date(cloudTask.updatedAt || cloudTask.createdAt).getTime();
+          const newerTask = cloudTime >= localTime ? cloudTask : localTask;
+          if (newerTask.completedAt || cloudTasks.archived.some(t => t.id === id && newerTask === cloudTask)) {
+            mergedArchived.push(winner);
+          } else {
+            mergedPending.push(winner);
+          }
+        } else {
+          if (localTask) {
+            if (tasks.archived.some(t => t.id === id)) {
+              mergedArchived.push(winner);
+            } else {
+              mergedPending.push(winner);
+            }
+          } else {
+            if (cloudTasks.archived.some(t => t.id === id)) {
+              mergedArchived.push(winner);
+            } else {
+              mergedPending.push(winner);
+            }
+          }
+        }
+      }
+
+      // 按创建时间倒序排序
+      mergedPending.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      mergedArchived.sort((a, b) => new Date(b.completedAt || b.createdAt) - new Date(a.completedAt || a.createdAt));
+
+      tasks = { pending: mergedPending, archived: mergedArchived };
+      saveDataLocal();
       render();
       lastSyncAt = new Date();
       updateSyncStatus('online', '已同步');
@@ -1629,6 +1710,11 @@
     } finally {
       isSyncing = false;
     }
+  }
+
+  // 只保存到本地（不触发同步，避免循环调用）
+  function saveDataLocal() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
   }
 
   // 将本地数据推送到云端
@@ -1655,17 +1741,35 @@
 
       // 新增或更新本地有的任务
       for (const task of allTasks) {
+        // 处理标签：本地是 tag 字符串，云端是 tags 数组
+        let tagsArray = task.tags;
+        if (!tagsArray && task.tag) {
+          tagsArray = [task.tag];
+        } else if (!tagsArray) {
+          tagsArray = [];
+        }
+
+        // 处理时间：本地可能是 Date.now() 数字时间戳，转成 ISO 字符串
+        let createdAtIso = task.createdAt;
+        if (typeof createdAtIso === 'number') {
+          createdAtIso = new Date(createdAtIso).toISOString();
+        }
+        let completedAtIso = task.completedAt;
+        if (typeof completedAtIso === 'number') {
+          completedAtIso = new Date(completedAtIso).toISOString();
+        }
+
         const payload = {
           id: task.id,
           user_id: currentUser.id,
           title: task.title,
-          description: task.description,
-          priority: task.priority,
-          tags: task.tags,
+          description: task.description || task.desc || '',
+          priority: task.priority || 'medium',
+          tags: tagsArray,
           status: tasks.archived.some(t => t.id === task.id) ? 'completed' : 'pending',
-          subtasks: task.subtasks,
-          created_at: task.createdAt,
-          completed_at: task.completedAt
+          subtasks: task.subtasks || [],
+          created_at: createdAtIso,
+          completed_at: completedAtIso
         };
 
         if (cloudIds.has(task.id)) {
