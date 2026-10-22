@@ -1536,6 +1536,8 @@
   let lastSyncAt = null;
   let isSyncing = false;
   let pendingSync = false;
+  let realtimeChannel = null;
+  let isRealtimeSync = false; // 标记是否是实时同步触发的，避免循环
 
   // 加载 Supabase 配置
   function loadSupabaseConfig() {
@@ -1820,10 +1822,107 @@
   // 触发同步（防抖）
   function triggerSync() {
     if (!syncEnabled || !currentUser) return;
+    if (isRealtimeSync) return; // 实时同步触发的变更不再回传
     if (syncTimer) clearTimeout(syncTimer);
     syncTimer = setTimeout(() => {
       syncToCloud();
     }, 1000);
+  }
+
+  // 开启实时订阅
+  function startRealtimeSync() {
+    if (!supabaseClient || !currentUser) return;
+    
+    // 如果已有订阅，先取消
+    if (realtimeChannel) {
+      supabaseClient.removeChannel(realtimeChannel);
+      realtimeChannel = null;
+    }
+
+    console.log('开启实时同步...');
+    
+    realtimeChannel = supabaseClient
+      .channel('tasks-changes')
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'tasks',
+        filter: `user_id=eq.${currentUser.id}`
+      }, (payload) => {
+        console.log('收到实时变更:', payload.eventType, payload.new || payload.old);
+        handleRealtimeChange(payload);
+      })
+      .subscribe((status) => {
+        console.log('实时订阅状态:', status);
+        if (status === 'SUBSCRIBED') {
+          updateSyncStatus('online', '实时同步');
+        } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+          updateSyncStatus('offline', '连接断开');
+        }
+      });
+  }
+
+  // 停止实时订阅
+  function stopRealtimeSync() {
+    if (realtimeChannel && supabaseClient) {
+      supabaseClient.removeChannel(realtimeChannel);
+      realtimeChannel = null;
+    }
+  }
+
+  // 处理实时变更事件
+  function handleRealtimeChange(payload) {
+    isRealtimeSync = true;
+    try {
+      const eventType = payload.eventType;
+
+      if (eventType === 'INSERT' || eventType === 'UPDATE') {
+        const t = payload.new;
+        const task = {
+          id: t.id,
+          title: t.title,
+          description: t.description || '',
+          desc: t.description || '',
+          priority: t.priority || 'medium',
+          tags: t.tags || [],
+          tag: (t.tags && t.tags[0]) || '',
+          subtasks: t.subtasks || [],
+          createdAt: t.created_at,
+          completedAt: t.completed_at,
+          updatedAt: t.updated_at
+        };
+
+        // 判断在 pending 还是 archived
+        const isCompleted = t.status === 'completed';
+        const targetList = isCompleted ? 'archived' : 'pending';
+        const otherList = isCompleted ? 'pending' : 'archived';
+
+        // 先从另一边移除（可能是状态变更移动了）
+        tasks[otherList] = tasks[otherList].filter(x => x.id !== task.id);
+
+        // 看看目标列表里有没有，有就替换，没有就加进去
+        const idx = tasks[targetList].findIndex(x => x.id === task.id);
+        if (idx >= 0) {
+          tasks[targetList][idx] = task;
+        } else {
+          tasks[targetList].unshift(task);
+        }
+
+        // 排序
+        tasks.pending.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+        tasks.archived.sort((a, b) => new Date(b.completedAt || b.createdAt) - new Date(a.completedAt || a.createdAt));
+
+      } else if (eventType === 'DELETE') {
+        const id = payload.old.id;
+        tasks.pending = tasks.pending.filter(x => x.id !== id);
+        tasks.archived = tasks.archived.filter(x => x.id !== id);
+      }
+
+      saveDataLocal();
+      render();
+    } finally {
+      setTimeout(() => { isRealtimeSync = false; }, 500);
+    }
   }
 
   // 登录
@@ -1837,6 +1936,7 @@
     syncEnabled = true;
     updateUserMenu();
     await syncFromCloud();
+    startRealtimeSync();
     return data.user;
   }
 
@@ -1854,12 +1954,14 @@
       updateUserMenu();
       // 将本地现有数据推送到云端
       await syncToCloud();
+      startRealtimeSync();
     }
     return data.user;
   }
 
   // 退出登录
   async function signOut() {
+    stopRealtimeSync();
     if (supabaseClient) {
       await supabaseClient.auth.signOut();
     }
@@ -1879,10 +1981,12 @@
         syncEnabled = true;
         updateUserMenu();
         await syncFromCloud();
+        startRealtimeSync();
 
         // 监听认证状态变化
         supabaseClient.auth.onAuthStateChange((event, session) => {
           if (event === 'SIGNED_OUT') {
+            stopRealtimeSync();
             currentUser = null;
             syncEnabled = false;
             updateUserMenu();
@@ -1891,7 +1995,7 @@
             currentUser = session.user;
             syncEnabled = true;
             updateUserMenu();
-            syncFromCloud();
+            syncFromCloud().then(() => startRealtimeSync());
           }
         });
       }
